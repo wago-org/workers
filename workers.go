@@ -11,7 +11,7 @@ import (
 	"github.com/wago-org/wago/plugin"
 )
 
-const PluginName = "github.com/wago-org/workers"
+const PluginName = "wago-org/workers"
 
 type WorkerID uint64
 

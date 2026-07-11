@@ -3,7 +3,6 @@
   "schema": "wago/v1",
   "module": "github.com/wago-org/workers",
   "version": "0.0.0",
-  "name": "Wago Workers",
   "short": "workers",
   "description": "Bounded, composable WebAssembly worker primitives for Wago plugins.",
   "license": "Apache-2.0",
@@ -13,7 +12,6 @@
   "tags": ["workers", "concurrency", "webassembly"],
   "plugins": [
     {
-      "name": "github.com/wago-org/workers",
       "capabilities": ["instance.manage", "instance.lifecycle"]
     }
   ]
