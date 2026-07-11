@@ -274,6 +274,23 @@ The corresponding exported constants are `DefaultWorkerQueueCapacity`,
 `DefaultWorkerMaxPayloadBytes`, `DefaultWorkerMaxQueueBytes`, `MaxWorkerQueueCapacity`,
 `MaxWorkerPayloadBytes`, and `MaxWorkerQueueBytes`.
 
+`WorkerOptions` bounds one worker; `WorkerLimits` bounds the **whole service**, so a
+guest cannot exhaust the host by spawning workers without end. It always applies — even
+when the host grants `instance.manage` with no `maxInstances` budget — and complements
+that core budget rather than replacing it. Pass it at construction:
+
+```go
+workerPlugin := workers.New(workers.WithLimits(workers.WorkerLimits{
+	MaxLiveWorkers: 128,       // default 64
+	MaxQueueBytes:  128 << 20, // default 64 MiB, summed across live workers
+}))
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `MaxLiveWorkers` | `64` | Max workers live at once. `Spawn` returns `ErrWorkerQuotaExceeded` past it. |
+| `MaxQueueBytes` | `64 MiB` | Max total per-worker `MaxQueueBytes` reservation summed across live workers. |
+
 ### Errors
 
 All errors are comparable sentinels - match them with `errors.Is`.
@@ -294,6 +311,7 @@ All errors are comparable sentinels - match them with `errors.Is`.
 | `ErrWorkerKilled` | Exit cause: `Kill` was requested. |
 | `ErrWorkerParentClosed` | Exit cause: the linked creator instance closed. |
 | `ErrWorkerRuntimeClosed` | Exit cause: the runtime shut down. |
+| `ErrWorkerQuotaExceeded` | Spawn would exceed the service-wide `WorkerLimits`. |
 
 ## Examples
 

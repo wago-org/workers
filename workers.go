@@ -22,6 +22,16 @@ const (
 	MaxWorkerQueueCapacity       uint32 = 1 << 16
 	MaxWorkerPayloadBytes        uint32 = 16 << 20
 	MaxWorkerQueueBytes          uint32 = 64 << 20
+
+	// DefaultMaxLiveWorkers bounds the number of simultaneously live workers for
+	// one service when WorkerLimits.MaxLiveWorkers is left zero. Each worker owns a
+	// managed instance, a goroutine, and a foreign stack, so an unbounded count is a
+	// denial-of-service vector; a default keeps Spawn bounded even when the host
+	// grants instance.manage without a maxInstances budget.
+	DefaultMaxLiveWorkers uint32 = 64
+	// DefaultMaxServiceQueueBytes bounds the total queued-payload reservation across
+	// all live workers when WorkerLimits.MaxQueueBytes is left zero.
+	DefaultMaxServiceQueueBytes uint64 = 64 << 20
 )
 
 type workerError string
@@ -43,7 +53,32 @@ const (
 	ErrWorkerKilled         workerError = "worker killed"
 	ErrWorkerParentClosed   workerError = "worker parent closed"
 	ErrWorkerRuntimeClosed  workerError = "worker runtime closed"
+	ErrWorkerQuotaExceeded  workerError = "worker service resource quota exceeded"
 )
+
+// WorkerLimits bounds the aggregate resources one worker service may hold at
+// once, independent of the per-worker WorkerOptions. Zero fields take the
+// package defaults. It complements — and does not replace — the core
+// instance.manage maxInstances budget: this cap always applies, so workers stay
+// bounded even when the host grants instance.manage without a budget.
+type WorkerLimits struct {
+	// MaxLiveWorkers is the maximum number of simultaneously live workers.
+	MaxLiveWorkers uint32
+	// MaxQueueBytes is the maximum total per-worker queue-byte reservation summed
+	// across all live workers (each worker reserves its MaxQueueBytes for its
+	// lifetime).
+	MaxQueueBytes uint64
+}
+
+func normalizeLimits(l WorkerLimits) WorkerLimits {
+	if l.MaxLiveWorkers == 0 {
+		l.MaxLiveWorkers = DefaultMaxLiveWorkers
+	}
+	if l.MaxQueueBytes == 0 {
+		l.MaxQueueBytes = DefaultMaxServiceQueueBytes
+	}
+	return l
+}
 
 type WorkerOptions struct {
 	QueueCapacity   uint32
@@ -76,9 +111,25 @@ var ServiceKey = plugin.NewServiceKey[*Workers]("wago.workers/v1")
 
 type Plugin struct {
 	service *Workers
+	limits  WorkerLimits
 }
 
-func New() *Plugin { return &Plugin{} }
+// Option configures the workers Plugin at construction.
+type Option func(*Plugin)
+
+// WithLimits sets the aggregate resource limits for the worker service. Zero
+// fields fall back to the package defaults (see WorkerLimits).
+func WithLimits(l WorkerLimits) Option { return func(p *Plugin) { p.limits = l } }
+
+// New creates the workers plugin. Pass WithLimits to override the default
+// aggregate resource caps.
+func New(opts ...Option) *Plugin {
+	p := &Plugin{}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
+}
 
 func (*Plugin) Info() wago.ExtensionInfo {
 	return wago.ExtensionInfo{
@@ -100,7 +151,7 @@ func (p *Plugin) Register(reg *wago.Registry) error {
 	if err != nil {
 		return err
 	}
-	p.service = newWorkers(manager)
+	p.service = newWorkers(manager, p.limits)
 	lifecycle.BeforeClose(func(ctx *wago.InstanceContext) { p.service.parentClosing(ctx.Instance) })
 	return plugin.Provide(reg, ServiceKey, p.service)
 }
@@ -124,6 +175,9 @@ func init() { wago.RegisterExtension(PluginName, func() wago.Extension { return 
 type Workers struct {
 	mu         sync.Mutex
 	manager    *wago.InstanceManager
+	limits     WorkerLimits
+	live       uint32 // number of workers currently holding a quota reservation
+	queueBytes uint64 // total per-worker queue-byte reservation currently held
 	next       WorkerID
 	workers    map[WorkerID]*worker
 	byInstance map[*wago.Instance]*worker
@@ -133,8 +187,34 @@ type Workers struct {
 	exitPanics []error
 }
 
-func newWorkers(manager *wago.InstanceManager) *Workers {
-	return &Workers{manager: manager, next: 1, workers: map[WorkerID]*worker{}, byInstance: map[*wago.Instance]*worker{}}
+func newWorkers(manager *wago.InstanceManager, limits WorkerLimits) *Workers {
+	return &Workers{manager: manager, limits: normalizeLimits(limits), next: 1,
+		workers: map[WorkerID]*worker{}, byInstance: map[*wago.Instance]*worker{}}
+}
+
+// reserve claims one live-worker slot and queueBytes of the aggregate queue-byte
+// budget, or reports ErrWorkerQuotaExceeded. The reservation is held until the
+// worker's goroutine finishes (see release), so a concurrent Spawn cannot exceed
+// the ceiling while a worker is still finalizing.
+func (w *Workers) reserve(queueBytes uint32) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return ErrWorkerRuntimeClosed
+	}
+	if w.live >= w.limits.MaxLiveWorkers || uint64(queueBytes) > w.limits.MaxQueueBytes-w.queueBytes {
+		return ErrWorkerQuotaExceeded
+	}
+	w.live++
+	w.queueBytes += uint64(queueBytes)
+	return nil
+}
+
+func (w *Workers) release(queueBytes uint32) {
+	w.mu.Lock()
+	w.live--
+	w.queueBytes -= uint64(queueBytes)
+	w.mu.Unlock()
 }
 
 func (w *Workers) OnMessage(fns ...func(*MessageContext) error) {
@@ -180,26 +260,37 @@ func (w *Workers) Spawn(caller wago.HostModule, tableIndex uint32, opts WorkerOp
 	if err != nil {
 		return 0, err
 	}
+	// Claim aggregate quota before forking so an over-limit Spawn never allocates a
+	// managed instance. The reservation is released by the worker's goroutine when
+	// it exits, or here on any failure before the goroutine starts.
+	if err := w.reserve(opts.MaxQueueBytes); err != nil {
+		return 0, err
+	}
 	child, err := w.manager.Fork(context.Background(), caller)
 	if errors.Is(err, wago.ErrManagedImportLifetime) {
+		w.release(opts.MaxQueueBytes)
 		return 0, ErrWorkerImportLifetime
 	}
 	if err != nil {
+		w.release(opts.MaxQueueBytes)
 		return 0, err
 	}
 	if err := child.ValidateVoidTableEntry(tableIndex); err != nil {
 		_ = child.Close()
+		w.release(opts.MaxQueueBytes)
 		return 0, err
 	}
 	w.mu.Lock()
 	if w.closed {
 		w.mu.Unlock()
 		_ = child.Close()
+		w.release(opts.MaxQueueBytes)
 		return 0, ErrWorkerRuntimeClosed
 	}
 	if w.next == 0 {
 		w.mu.Unlock()
 		_ = child.Close()
+		w.release(opts.MaxQueueBytes)
 		return 0, ErrWorkerIDExhausted
 	}
 	id := w.next
@@ -443,6 +534,10 @@ func (wr *worker) run() {
 			fn(ctx)
 		}()
 	}
+	// Release aggregate quota only after the instance is closed and every exit
+	// observer has run, so a concurrent Spawn cannot exceed the ceiling while this
+	// worker is still finalizing.
+	wr.owner.release(wr.maxQueueBytes)
 	close(wr.done)
 }
 
