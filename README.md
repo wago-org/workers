@@ -4,10 +4,10 @@
 </div>
 
 <p align="center">
-    <a href="https://pkg.go.dev/github.com/wago-org/workers"><img src="https://pkg.go.dev/badge/github.com/wago-org/workers.svg" alt="Go Reference"></a>
-    <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+    <a href="https://github.com/wago-org/workers/actions/workflows/ci.yml"><img src="https://github.com/wago-org/workers/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+    <a href="https://codecov.io/gh/wago-org/workers"><img src="https://codecov.io/gh/wago-org/workers/branch/main/graph/badge.svg" alt="Coverage"></a>
     <a href="https://go.dev/"><img src="https://img.shields.io/badge/go-%3E%3D1.24-00ADD8.svg" alt="Go >= 1.24"></a>
-    <img src="https://img.shields.io/badge/stability-experimental-orange.svg" alt="Stability: experimental">
+    <a href="https://github.com/wago-org/wago"><img src="https://img.shields.io/badge/wago-%3E%3D0.1.0-6E56CF.svg" alt="Wago >= 0.1.0"></a>
 </p>
 
 <details>
