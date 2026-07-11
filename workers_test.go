@@ -60,6 +60,50 @@ func integrationModule() []byte {
 	)
 }
 
+func TestWorkerLimitsQuota(t *testing.T) {
+	// Defaults apply when a field is zero.
+	if got := normalizeLimits(WorkerLimits{}); got.MaxLiveWorkers != DefaultMaxLiveWorkers || got.MaxQueueBytes != DefaultMaxServiceQueueBytes {
+		t.Fatalf("normalizeLimits(zero) = %+v", got)
+	}
+	if got := normalizeLimits(WorkerLimits{MaxLiveWorkers: 3}); got.MaxQueueBytes != DefaultMaxServiceQueueBytes || got.MaxLiveWorkers != 3 {
+		t.Fatalf("normalizeLimits partial = %+v", got)
+	}
+
+	// MaxLiveWorkers ceiling: the third reservation is rejected, and a release frees a slot.
+	w := newWorkers(nil, WorkerLimits{MaxLiveWorkers: 2, MaxQueueBytes: 1 << 20})
+	if err := w.reserve(100); err != nil {
+		t.Fatalf("reserve 1: %v", err)
+	}
+	if err := w.reserve(100); err != nil {
+		t.Fatalf("reserve 2: %v", err)
+	}
+	if err := w.reserve(100); !errors.Is(err, ErrWorkerQuotaExceeded) {
+		t.Fatalf("reserve 3 = %v, want ErrWorkerQuotaExceeded", err)
+	}
+	w.release(100)
+	if err := w.reserve(100); err != nil {
+		t.Fatalf("reserve after release: %v", err)
+	}
+
+	// Aggregate queue-byte ceiling is enforced independently and cannot overflow.
+	w2 := newWorkers(nil, WorkerLimits{MaxLiveWorkers: 100, MaxQueueBytes: 1000})
+	if err := w2.reserve(600); err != nil {
+		t.Fatalf("reserve 600: %v", err)
+	}
+	if err := w2.reserve(600); !errors.Is(err, ErrWorkerQuotaExceeded) {
+		t.Fatalf("reserve 600 over budget = %v, want ErrWorkerQuotaExceeded", err)
+	}
+	if err := w2.reserve(400); err != nil {
+		t.Fatalf("reserve exact remaining 400: %v", err)
+	}
+
+	// A closed service rejects reservations.
+	w2.closed = true
+	if err := w2.reserve(1); !errors.Is(err, ErrWorkerRuntimeClosed) {
+		t.Fatalf("reserve on closed = %v, want ErrWorkerRuntimeClosed", err)
+	}
+}
+
 func TestPluginSpawnsCopiesMessageAndStops(t *testing.T) {
 	p := &integrationPlugin{exits: make(chan WorkerExitContext, 1), messages: make(chan MessageContext, 1)}
 	rt := wago.NewRuntime()
