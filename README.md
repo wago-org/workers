@@ -78,7 +78,7 @@ your `wago.json`:
   "dependencies": ["github.com/wago-org/workers"],
   "plugins": [
     {
-      "name": "workers",
+      "name": "github.com/wago-org/workers",
       "capabilities": {
         "instance.manage": { "maxInstances": 64 },
         "instance.lifecycle": true
