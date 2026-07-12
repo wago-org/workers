@@ -10,6 +10,7 @@
   "homepage": "https://github.com/wago-org/workers#readme",
   "category": "concurrency",
   "tags": ["workers", "concurrency", "webassembly"],
+  "keywords": ["workers", "worker", "concurrency", "webassembly", "wasm", "mailbox", "actor", "goroutine", "supervision", "plugin"],
   "plugins": [
     {
       "capabilities": ["instance.manage", "instance.lifecycle"]
