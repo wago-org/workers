@@ -1,8 +1,7 @@
 {
-  "$schema": "https://wago.sh/schema.json",
-  "schema": "wago/v1",
+  "$schema": "https://wago.sh/v0/schema.json",
   "module": "github.com/wago-org/workers",
-  "version": "0.1.0",
+  "version": "0.0.0",
   "name": "Wago Workers",
   "short": "workers",
   "description": "Bounded, composable WebAssembly worker primitives for Wago plugins.",
@@ -10,11 +9,5 @@
   "repository": "https://github.com/wago-org/workers",
   "homepage": "https://github.com/wago-org/workers#readme",
   "category": "concurrency",
-  "tags": ["workers", "concurrency", "webassembly"],
-  "plugins": [
-    {
-      "name": "workers",
-      "capabilities": ["instance.manage", "instance.lifecycle"]
-    }
-  ]
+  "tags": ["workers", "concurrency", "webassembly"]
 }
