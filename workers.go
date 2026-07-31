@@ -133,7 +133,7 @@ func New(opts ...Option) *Plugin {
 
 func (*Plugin) Info() wago.ExtensionInfo {
 	return wago.ExtensionInfo{
-		ID: "wago.workers", Name: "Workers", Version: "0.1.0",
+		ID: "wago.workers", Name: "Workers", Version: "0.0.0",
 		Description: "Bounded, extension-scoped WebAssembly worker primitives",
 		Stability:   wago.Experimental, Repository: "https://github.com/wago-org/workers",
 		License: "Apache-2.0", Tags: []string{"workers", "concurrency", "plugin-foundation"},

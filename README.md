@@ -53,7 +53,7 @@ What you get out of the box:
 - **Lifecycle-safe**: a linked worker is torn down cooperatively when its creating
   instance closes, and every worker is drained when the runtime shuts down.
 
-> **Stability:** experimental (`v0.1.0`). The API may change before `v1.0.0`.
+> **Stability:** experimental (`v0.0.0`). The API may change without notice.
 
 ## Installation
 
@@ -70,21 +70,35 @@ go get github.com/wago-org/workers
 ```
 
 The plugin requires two privileged capabilities - `instance.manage` (to fork and manage
-worker instances) and `instance.lifecycle` (to observe parent shutdown). Grant them in
-your `wago.json`:
+worker instances) and `instance.lifecycle` (to observe parent shutdown). Select the
+plugin in `wago.json`:
 
 ```json
 {
-  "dependencies": ["github.com/wago-org/workers"],
-  "plugins": [
-    {
-      "name": "workers",
+  "$schema": "https://wago.sh/v0/schema.json",
+  "plugins": {
+    "wago-org/workers": "^0.0.0"
+  }
+}
+```
+
+Exact versions and reviewed authority belong in `wago-lock.json`:
+
+```json
+{
+  "plugins": {
+    "wago-org/workers": {
+      "version": "0.0.0",
+      "requiredCapabilities": [
+        "instance.manage",
+        "instance.lifecycle"
+      ],
       "capabilities": {
         "instance.manage": { "maxInstances": 64 },
         "instance.lifecycle": true
       }
     }
-  ]
+  }
 }
 ```
 
@@ -348,8 +362,8 @@ go test -race ./...
   runtime-close drain).
 - **`register/`** - a blank-import shim that activates init-time registration for
   Wago-generated hosts.
-- **`wago.json`** - the package manifest declaring the plugin and its required
-  capabilities.
+- **`wago.json`** - the package manifest declaring plugin dependencies and
+  version constraints; reviewed capabilities live in `wago-lock.json`.
 
 Design notes:
 
