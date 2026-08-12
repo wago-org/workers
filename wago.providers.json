@@ -1,0 +1,68 @@
+{
+  "$schema": "https://wago.sh/v1/providers.schema.json",
+  "providers": [
+    {
+      "importPath": "github.com/wago-org/workers/register",
+      "definition": {
+        "id": "github.com/wago-org/workers",
+        "name": "Workers",
+        "version": "0.1.0",
+        "description": "Bounded, composable WebAssembly worker primitives for Wago plugins.",
+        "stability": "experimental",
+        "compatibility": {
+          "engines": {
+            "wago": "\u003e=0.1.0"
+          }
+        },
+        "provenance": {
+          "homepage": "https://github.com/wago-org/workers#readme",
+          "repository": "https://github.com/wago-org/workers",
+          "license": "Apache-2.0",
+          "authors": [
+            "Wago contributors"
+          ]
+        },
+        "authorities": [
+          {
+            "name": "instance.close.observe",
+            "mode": "required",
+            "reason": "stop linked workers when their exact creator closes",
+            "scope": {}
+          },
+          {
+            "name": "instance.manage",
+            "mode": "required",
+            "reason": "fork and own bounded worker instances",
+            "scope": {
+              "maxInstances": 1024,
+              "maxMemoryBytes": 4294967296
+            }
+          }
+        ],
+        "configSchema": {
+          "additionalProperties": false,
+          "properties": {
+            "maxLiveWorkers": {
+              "maximum": 65536,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "maxQueueBytes": {
+              "maximum": 68719476736,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "provides": [
+          {
+            "id": "github.com/wago-org/workers/service",
+            "major": 1
+          }
+        ]
+      },
+      "definitionDigest": "sha256:efe2db34dbba3b2782a5ec3fbc741945bb98c2d5ddb20d127b0fa31de4fb3425"
+    }
+  ]
+}

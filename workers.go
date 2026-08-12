@@ -2,16 +2,20 @@
 package workers
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"sort"
 	"sync"
 
 	"github.com/wago-org/wago"
-	"github.com/wago-org/wago/plugin"
+	wagoplugin "github.com/wago-org/wago/plugin"
 )
 
-const PluginName = "workers"
+const PluginID = "github.com/wago-org/workers"
 
 type WorkerID uint64
 
@@ -26,8 +30,8 @@ const (
 	// DefaultMaxLiveWorkers bounds the number of simultaneously live workers for
 	// one service when WorkerLimits.MaxLiveWorkers is left zero. Each worker owns a
 	// managed instance, a goroutine, and a foreign stack, so an unbounded count is a
-	// denial-of-service vector; a default keeps Spawn bounded even when the host
-	// grants instance.manage without a maxInstances budget.
+	// denial-of-service vector; a package-level default remains useful even when
+	// the reviewed instance.manage grant permits a larger ceiling.
 	DefaultMaxLiveWorkers uint32 = 64
 	// DefaultMaxServiceQueueBytes bounds the total queued-payload reservation across
 	// all live workers when WorkerLimits.MaxQueueBytes is left zero.
@@ -107,70 +111,188 @@ type WorkerExitContext struct {
 	Err      error
 }
 
-var ServiceKey = plugin.NewServiceKey[*Workers]("wago.workers/v1")
-
-type Plugin struct {
-	service *Workers
-	limits  WorkerLimits
+// Service is Workers' typed cross-plugin contract. Call it only inside the
+// callback of a wagoplugin.Ref; Wago holds the provider alive for that callback.
+type Service interface {
+	Spawn(wago.HostModule, uint32, WorkerOptions) (WorkerID, error)
+	Send(WorkerID, uint64, []byte) error
+	Current(wago.HostModule) (WorkerID, error)
+	DispatchNext(context.Context, wago.HostModule) error
+	Link(wago.HostModule, WorkerID) error
+	Kill(WorkerID) error
+	ObserveMessages(func(*MessageContext) error) (Subscription, error)
+	ObserveExits(func(*WorkerExitContext)) (Subscription, error)
+	Unsubscribe(Subscription) error
 }
 
-// Option configures the workers Plugin at construction.
-type Option func(*Plugin)
+// Contract is the major-versioned Workers composition seam.
+var Contract = wagoplugin.NewContract[Service](PluginID+"/service", 1)
 
-// WithLimits sets the aggregate resource limits for the worker service. Zero
-// fields fall back to the package defaults (see WorkerLimits).
-func WithLimits(l WorkerLimits) Option { return func(p *Plugin) { p.limits = l } }
+type pluginConfig struct {
+	MaxLiveWorkers *uint32 `json:"maxLiveWorkers,omitempty"`
+	MaxQueueBytes  *uint64 `json:"maxQueueBytes,omitempty"`
+}
 
-// New creates the workers plugin. Pass WithLimits to override the default
-// aggregate resource caps.
-func New(opts ...Option) *Plugin {
-	p := &Plugin{}
-	for _, opt := range opts {
-		opt(p)
+var configSchema = json.RawMessage(`{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "maxLiveWorkers": {"type": "integer", "minimum": 1, "maximum": 65536},
+    "maxQueueBytes": {"type": "integer", "minimum": 1, "maximum": 68719476736}
+  }
+}`)
+
+func decodePluginConfig(raw json.RawMessage) (pluginConfig, WorkerLimits, error) {
+	if len(raw) == 0 {
+		raw = json.RawMessage(`{}`)
 	}
-	return p
+	if err := validateConfigObject(raw); err != nil {
+		return pluginConfig{}, WorkerLimits{}, fmt.Errorf("workers: config: %w", err)
+	}
+	var cfg pluginConfig
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&cfg); err != nil {
+		return pluginConfig{}, WorkerLimits{}, fmt.Errorf("workers: config: %w", err)
+	}
+	if err := dec.Decode(new(any)); err != io.EOF {
+		return pluginConfig{}, WorkerLimits{}, fmt.Errorf("workers: config has a trailing JSON value")
+	}
+	limits := WorkerLimits{MaxLiveWorkers: DefaultMaxLiveWorkers, MaxQueueBytes: DefaultMaxServiceQueueBytes}
+	if cfg.MaxLiveWorkers != nil {
+		if *cfg.MaxLiveWorkers == 0 || *cfg.MaxLiveWorkers > 65536 {
+			return pluginConfig{}, WorkerLimits{}, fmt.Errorf("workers: maxLiveWorkers must be in [1, 65536]")
+		}
+		limits.MaxLiveWorkers = *cfg.MaxLiveWorkers
+	}
+	if cfg.MaxQueueBytes != nil {
+		if *cfg.MaxQueueBytes == 0 || *cfg.MaxQueueBytes > 64<<30 {
+			return pluginConfig{}, WorkerLimits{}, fmt.Errorf("workers: maxQueueBytes must be in [1, 68719476736]")
+		}
+		limits.MaxQueueBytes = *cfg.MaxQueueBytes
+	}
+	return cfg, limits, nil
 }
 
-func (*Plugin) Info() wago.ExtensionInfo {
-	return wago.ExtensionInfo{
-		ID: "wago.workers", Name: "Workers", Version: "0.0.0",
-		Description: "Bounded, extension-scoped WebAssembly worker primitives",
-		Stability:   wago.Experimental, Repository: "https://github.com/wago-org/workers",
-		License: "Apache-2.0", Tags: []string{"workers", "concurrency", "plugin-foundation"},
-		RequiresCapabilities: []wago.PluginCapability{wago.PluginManagedInstances, wago.PluginInstanceHooks},
-		Compat:               wago.Compatibility{Engines: map[string]string{"wago": ">=0.1.0"}},
+func validateConfigObject(raw json.RawMessage) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	token, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if token != json.Delim('{') {
+		return fmt.Errorf("must be a JSON object")
+	}
+	seen := map[string]struct{}{}
+	for dec.More() {
+		keyToken, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return fmt.Errorf("object key is not a string")
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return fmt.Errorf("duplicate field %q", key)
+		}
+		seen[key] = struct{}{}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return err
+		}
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("field %q must not be null", key)
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return err
+	}
+	if err := dec.Decode(new(any)); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("has a trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+// Definition returns fresh immutable metadata for Workers' explicit provider.
+func Definition() wago.PluginDefinition {
+	return wago.PluginDefinition{
+		ID:          PluginID,
+		Name:        "Workers",
+		Version:     "0.1.0",
+		Description: "Bounded, composable WebAssembly worker primitives for Wago plugins.",
+		Stability:   wago.Experimental,
+		Compatibility: wago.Compatibility{
+			Engines: map[string]string{"wago": ">=0.1.0"},
+		},
+		Provenance: wago.PluginProvenance{
+			Homepage:   "https://github.com/wago-org/workers#readme",
+			Repository: "https://github.com/wago-org/workers",
+			License:    "Apache-2.0",
+			Authors:    []string{"Wago contributors"},
+		},
+		Authorities: []wago.AuthorityRequest{
+			{
+				Name: wago.AuthorityInstanceManage, Mode: wago.AuthorityRequired,
+				Reason: "fork and own bounded worker instances",
+				Scope:  wago.AuthorityScope{MaxInstances: 1024, MaxMemoryBytes: 4 << 30},
+			},
+			{
+				Name: wago.AuthorityInstanceCloseObserve, Mode: wago.AuthorityRequired,
+				Reason: "stop linked workers when their exact creator closes",
+			},
+		},
+		ConfigSchema: append(json.RawMessage(nil), configSchema...),
+		Provides:     []wago.ContractSpec{Contract.Spec()},
 	}
 }
 
-func (p *Plugin) Register(reg *wago.Registry) error {
+// Provider is Workers' side-effect-free catalog entry.
+func Provider() wago.PluginProvider {
+	return wago.PluginProvider{
+		Definition: Definition(),
+		New:        func() wago.Plugin { return new(plugin) },
+		ValidateConfig: func(raw json.RawMessage) error {
+			_, _, err := decodePluginConfig(raw)
+			return err
+		},
+	}
+}
+
+type plugin struct{ service *Workers }
+
+func (p *plugin) Register(reg *wago.Registrar) error {
+	var cfg pluginConfig
+	if err := reg.Config(&cfg); err != nil {
+		return err
+	}
+	limits := WorkerLimits{MaxLiveWorkers: DefaultMaxLiveWorkers, MaxQueueBytes: DefaultMaxServiceQueueBytes}
+	if cfg.MaxLiveWorkers != nil {
+		limits.MaxLiveWorkers = *cfg.MaxLiveWorkers
+	}
+	if cfg.MaxQueueBytes != nil {
+		limits.MaxQueueBytes = *cfg.MaxQueueBytes
+	}
 	manager, err := reg.ManagedInstances()
 	if err != nil {
 		return err
 	}
-	lifecycle, err := reg.InstanceLifecycle()
+	closeObserver, err := reg.InstanceCloseObserver()
 	if err != nil {
 		return err
 	}
-	p.service = newWorkers(manager, p.limits)
-	lifecycle.BeforeClose(func(ctx *wago.InstanceContext) { p.service.parentClosing(ctx.Instance) })
-	return plugin.Provide(reg, ServiceKey, p.service)
-}
-
-func (p *Plugin) Stop(context.Context) error {
-	if p == nil || p.service == nil {
-		return nil
+	p.service = newWorkers(manager, limits)
+	if err := closeObserver.Before(func(event wago.InstanceCloseEvent) { p.service.parentClosing(event.Instance) }); err != nil {
+		return err
 	}
-	return p.service.close()
-}
-
-func (p *Plugin) Service() *Workers {
-	if p == nil {
-		return nil
+	if err := wagoplugin.Provide(reg, Contract, Service(p.service)); err != nil {
+		return err
 	}
-	return p.service
+	return reg.Lifecycle(wago.PluginLifecycle{Stop: func(context.Context) error { return p.service.close() }})
 }
-
-func init() { wago.RegisterExtension(PluginName, func() wago.Extension { return New() }) }
 
 type Workers struct {
 	mu         sync.Mutex
@@ -180,16 +302,18 @@ type Workers struct {
 	queueBytes uint64 // total per-worker queue-byte reservation currently held
 	next       WorkerID
 	workers    map[WorkerID]*worker
-	byInstance map[*wago.Instance]*worker
-	messages   []func(*MessageContext) error
-	exits      []func(*WorkerExitContext)
+	byInstance map[wago.InstanceIdentity]*worker
+	nextObs    uint64
+	messages   map[uint64]*messageObserver
+	exits      map[uint64]*exitObserver
 	closed     bool
 	exitPanics []error
 }
 
 func newWorkers(manager *wago.InstanceManager, limits WorkerLimits) *Workers {
 	return &Workers{manager: manager, limits: normalizeLimits(limits), next: 1,
-		workers: map[WorkerID]*worker{}, byInstance: map[*wago.Instance]*worker{}}
+		workers: map[WorkerID]*worker{}, byInstance: map[wago.InstanceIdentity]*worker{},
+		messages: map[uint64]*messageObserver{}, exits: map[uint64]*exitObserver{}}
 }
 
 // reserve claims one live-worker slot and queueBytes of the aggregate queue-byte
@@ -217,19 +341,208 @@ func (w *Workers) release(queueBytes uint32) {
 	w.mu.Unlock()
 }
 
-func (w *Workers) OnMessage(fns ...func(*MessageContext) error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if !w.closed {
-		w.messages = append(w.messages, fns...)
-	}
+type subscriptionKind uint8
+
+const (
+	messageSubscription subscriptionKind = iota + 1
+	exitSubscription
+)
+
+// Subscription is an opaque observer token. It has no provider operations of
+// its own; pass it back to Service.Unsubscribe inside a leased contract call.
+type Subscription struct {
+	id   uint64
+	kind subscriptionKind
 }
-func (w *Workers) OnExit(fns ...func(*WorkerExitContext)) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if !w.closed {
-		w.exits = append(w.exits, fns...)
+
+type observerGate struct {
+	mu       sync.Mutex
+	cond     *sync.Cond
+	active   bool
+	inFlight uint32
+}
+
+func newObserverGate() *observerGate {
+	g := &observerGate{active: true}
+	g.cond = sync.NewCond(&g.mu)
+	return g
+}
+
+func (g *observerGate) begin() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.active {
+		return false
 	}
+	g.inFlight++
+	return true
+}
+
+func (g *observerGate) end() {
+	g.mu.Lock()
+	g.inFlight--
+	if g.inFlight == 0 {
+		g.cond.Broadcast()
+	}
+	g.mu.Unlock()
+}
+
+func (g *observerGate) stop() {
+	g.mu.Lock()
+	g.active = false
+	for g.inFlight != 0 {
+		g.cond.Wait()
+	}
+	g.mu.Unlock()
+}
+
+type messageObserver struct {
+	id   uint64
+	gate *observerGate
+	fn   func(*MessageContext) error
+}
+
+func (o *messageObserver) invoke(ctx *MessageContext) (err error) {
+	if !o.gate.begin() {
+		return nil
+	}
+	defer o.gate.end()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("workers: message observer %d panicked: %v", o.id, recovered)
+		}
+	}()
+	return o.fn(ctx)
+}
+
+type exitObserver struct {
+	id   uint64
+	gate *observerGate
+	fn   func(*WorkerExitContext)
+}
+
+func (o *exitObserver) invoke(ctx *WorkerExitContext) (panicErr error) {
+	if !o.gate.begin() {
+		return nil
+	}
+	defer o.gate.end()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panicErr = fmt.Errorf("workers: exit observer %d panicked: %v", o.id, recovered)
+		}
+	}()
+	o.fn(ctx)
+	return nil
+}
+
+func (w *Workers) nextObserverIDLocked() (uint64, error) {
+	w.nextObs++
+	if w.nextObs == 0 {
+		return 0, fmt.Errorf("workers: observer ID space exhausted")
+	}
+	return w.nextObs, nil
+}
+
+// ObserveMessages registers a message observer until it is unsubscribed.
+func (w *Workers) ObserveMessages(fn func(*MessageContext) error) (Subscription, error) {
+	if w == nil || fn == nil {
+		return Subscription{}, fmt.Errorf("workers: invalid message observer")
+	}
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return Subscription{}, ErrWorkerRuntimeClosed
+	}
+	id, err := w.nextObserverIDLocked()
+	if err != nil {
+		w.mu.Unlock()
+		return Subscription{}, err
+	}
+	observer := &messageObserver{id: id, gate: newObserverGate(), fn: fn}
+	w.messages[id] = observer
+	w.mu.Unlock()
+	return Subscription{id: id, kind: messageSubscription}, nil
+}
+
+// ObserveExits registers an exit observer until it is unsubscribed.
+func (w *Workers) ObserveExits(fn func(*WorkerExitContext)) (Subscription, error) {
+	if w == nil || fn == nil {
+		return Subscription{}, fmt.Errorf("workers: invalid exit observer")
+	}
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return Subscription{}, ErrWorkerRuntimeClosed
+	}
+	id, err := w.nextObserverIDLocked()
+	if err != nil {
+		w.mu.Unlock()
+		return Subscription{}, err
+	}
+	observer := &exitObserver{id: id, gate: newObserverGate(), fn: fn}
+	w.exits[id] = observer
+	w.mu.Unlock()
+	return Subscription{id: id, kind: exitSubscription}, nil
+}
+
+// Unsubscribe removes one observer and waits for callbacks already in flight.
+// It is idempotent. Do not call it from inside that observer's callback.
+func (w *Workers) Unsubscribe(subscription Subscription) error {
+	if w == nil || subscription.id == 0 {
+		return fmt.Errorf("workers: invalid subscription")
+	}
+	var gate *observerGate
+	w.mu.Lock()
+	switch subscription.kind {
+	case messageSubscription:
+		if observer := w.messages[subscription.id]; observer != nil {
+			delete(w.messages, subscription.id)
+			gate = observer.gate
+		}
+	case exitSubscription:
+		if observer := w.exits[subscription.id]; observer != nil {
+			delete(w.exits, subscription.id)
+			gate = observer.gate
+		}
+	default:
+		w.mu.Unlock()
+		return fmt.Errorf("workers: invalid subscription")
+	}
+	w.mu.Unlock()
+	if gate != nil {
+		gate.stop()
+	}
+	return nil
+}
+
+func (w *Workers) messageObservers() []*messageObserver {
+	w.mu.Lock()
+	ids := make([]uint64, 0, len(w.messages))
+	for id := range w.messages {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	observers := make([]*messageObserver, 0, len(ids))
+	for _, id := range ids {
+		observers = append(observers, w.messages[id])
+	}
+	w.mu.Unlock()
+	return observers
+}
+
+func (w *Workers) exitObservers() []*exitObserver {
+	w.mu.Lock()
+	ids := make([]uint64, 0, len(w.exits))
+	for id := range w.exits {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	observers := make([]*exitObserver, 0, len(ids))
+	for _, id := range ids {
+		observers = append(observers, w.exits[id])
+	}
+	w.mu.Unlock()
+	return observers
 }
 
 func normalizeOptions(o WorkerOptions) (WorkerOptions, error) {
@@ -252,7 +565,7 @@ func (w *Workers) Spawn(caller wago.HostModule, tableIndex uint32, opts WorkerOp
 	if w == nil || w.manager == nil {
 		return 0, ErrWorkersInactive
 	}
-	parent, err := w.manager.Caller(caller)
+	parent, err := w.manager.CallerIdentity(caller)
 	if err != nil {
 		return 0, ErrInvalidWorkerCaller
 	}
@@ -299,10 +612,11 @@ func (w *Workers) Spawn(caller wago.HostModule, tableIndex uint32, opts WorkerOp
 	} else {
 		w.next++
 	}
-	wr := &worker{owner: w, id: id, creator: parent, instance: child, tableIndex: tableIndex,
+	childIdentity := child.Identity()
+	wr := &worker{owner: w, id: id, creator: parent, identity: childIdentity, instance: child, tableIndex: tableIndex,
 		queue: make([]message, opts.QueueCapacity), maxPayload: opts.MaxPayloadBytes, maxQueueBytes: opts.MaxQueueBytes,
-		wake: make(chan struct{}, 1), done: make(chan struct{}), messages: append([]func(*MessageContext) error(nil), w.messages...), exits: append([]func(*WorkerExitContext){}, w.exits...)}
-	w.workers[id], w.byInstance[child.Instance()] = wr, wr
+		wake: make(chan struct{}, 1), done: make(chan struct{})}
+	w.workers[id], w.byInstance[childIdentity] = wr, wr
 	w.mu.Unlock()
 	go wr.run()
 	return id, nil
@@ -322,7 +636,7 @@ func (w *Workers) Current(caller wago.HostModule) (WorkerID, error) {
 		return 0, ErrWorkerNotFound
 	}
 	w.mu.Lock()
-	wr := w.byInstance[owned.Instance()]
+	wr := w.byInstance[owned.Identity()]
 	w.mu.Unlock()
 	if wr == nil {
 		return 0, ErrWorkerNotFound
@@ -330,22 +644,25 @@ func (w *Workers) Current(caller wago.HostModule) (WorkerID, error) {
 	return wr.id, nil
 }
 
-func (w *Workers) DispatchNext(caller wago.HostModule) error {
+func (w *Workers) DispatchNext(ctx context.Context, caller wago.HostModule) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	owned, err := w.manager.ManagedCaller(caller)
 	if err != nil {
 		return ErrInvalidWorkerCaller
 	}
 	w.mu.Lock()
-	wr := w.byInstance[owned.Instance()]
+	wr := w.byInstance[owned.Identity()]
 	w.mu.Unlock()
 	if wr == nil {
 		return ErrWorkerNotFound
 	}
-	return wr.dispatch(caller)
+	return wr.dispatch(ctx, caller)
 }
 
 func (w *Workers) Link(caller wago.HostModule, childID WorkerID) error {
-	parent, err := w.manager.Caller(caller)
+	parent, err := w.manager.CallerIdentity(caller)
 	if err != nil {
 		return ErrInvalidWorkerCaller
 	}
@@ -353,7 +670,7 @@ func (w *Workers) Link(caller wago.HostModule, childID WorkerID) error {
 	if err != nil {
 		return err
 	}
-	if wr.creator != parent || wr.instance.Instance() == parent {
+	if wr.creator != parent || wr.identity == parent {
 		return ErrInvalidWorkerLink
 	}
 	wr.mu.Lock()
@@ -398,7 +715,8 @@ type worker struct {
 	mu                            sync.Mutex
 	owner                         *Workers
 	id                            WorkerID
-	creator                       *wago.Instance
+	creator                       wago.InstanceIdentity
+	identity                      wago.InstanceIdentity
 	instance                      *wago.ManagedInstance
 	tableIndex                    uint32
 	queue                         []message
@@ -409,8 +727,6 @@ type worker struct {
 	done                          chan struct{}
 	stopping, dispatching, linked bool
 	stopErr                       error
-	messages                      []func(*MessageContext) error
-	exits                         []func(*WorkerExitContext)
 }
 
 func (wr *worker) signal() {
@@ -443,7 +759,7 @@ func (wr *worker) enqueue(tag uint64, payload []byte) error {
 	return nil
 }
 
-func (wr *worker) dispatch(caller wago.HostModule) error {
+func (wr *worker) dispatch(ctx context.Context, caller wago.HostModule) error {
 	wr.mu.Lock()
 	if wr.dispatching {
 		wr.mu.Unlock()
@@ -472,8 +788,8 @@ func (wr *worker) dispatch(caller wago.HostModule) error {
 			wr.queuedBytes -= uint32(len(msg.payload))
 			wr.mu.Unlock()
 			ctx := &MessageContext{WorkerID: wr.id, Tag: msg.tag, Payload: msg.payload, Caller: caller}
-			for _, fn := range wr.messages {
-				if err := fn(ctx); err != nil {
+			for _, observer := range wr.owner.messageObservers() {
+				if err := observer.invoke(ctx); err != nil {
 					wr.stop(err)
 					return err
 				}
@@ -485,6 +801,8 @@ func (wr *worker) dispatch(caller wago.HostModule) error {
 		case <-wr.wake:
 		case <-expired:
 			return ErrInvalidWorkerCaller
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 }
@@ -515,24 +833,18 @@ func (wr *worker) run() {
 	} else if err != nil {
 		kind = WorkerFailed
 	}
-	in := wr.instance.Instance()
 	_ = wr.instance.Close()
 	wr.owner.mu.Lock()
 	delete(wr.owner.workers, wr.id)
-	delete(wr.owner.byInstance, in)
+	delete(wr.owner.byInstance, wr.identity)
 	wr.owner.mu.Unlock()
 	ctx := &WorkerExitContext{WorkerID: wr.id, Kind: kind, Err: err}
-	for i, fn := range wr.exits {
-		func() {
-			defer func() {
-				if v := recover(); v != nil {
-					wr.owner.mu.Lock()
-					wr.owner.exitPanics = append(wr.owner.exitPanics, fmt.Errorf("worker %d exit observer %d: %v", wr.id, i, v))
-					wr.owner.mu.Unlock()
-				}
-			}()
-			fn(ctx)
-		}()
+	for _, observer := range wr.owner.exitObservers() {
+		if panicErr := observer.invoke(ctx); panicErr != nil {
+			wr.owner.mu.Lock()
+			wr.owner.exitPanics = append(wr.owner.exitPanics, fmt.Errorf("worker %d: %w", wr.id, panicErr))
+			wr.owner.mu.Unlock()
+		}
 	}
 	// Release aggregate quota only after the instance is closed and every exit
 	// observer has run, so a concurrent Spawn cannot exceed the ceiling while this
@@ -541,7 +853,7 @@ func (wr *worker) run() {
 	close(wr.done)
 }
 
-func (w *Workers) parentClosing(parent *wago.Instance) {
+func (w *Workers) parentClosing(parent wago.InstanceIdentity) {
 	w.mu.Lock()
 	var linked []*worker
 	for _, wr := range w.workers {
@@ -578,8 +890,20 @@ func (w *Workers) close() error {
 		<-wr.done
 	}
 	w.mu.Lock()
+	observers := make([]*observerGate, 0, len(w.messages)+len(w.exits))
+	for _, observer := range w.messages {
+		observers = append(observers, observer.gate)
+	}
+	for _, observer := range w.exits {
+		observers = append(observers, observer.gate)
+	}
+	w.messages = nil
+	w.exits = nil
 	errs := append([]error(nil), w.exitPanics...)
 	w.exitPanics = nil
 	w.mu.Unlock()
+	for _, observer := range observers {
+		observer.stop()
+	}
 	return errors.Join(errs...)
 }

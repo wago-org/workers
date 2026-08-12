@@ -1,13 +1,17 @@
 {
-  "$schema": "https://wago.sh/v0/schema.json",
-  "module": "github.com/wago-org/workers",
-  "version": "0.0.0",
-  "name": "Wago Workers",
-  "short": "workers",
-  "description": "Bounded, composable WebAssembly worker primitives for Wago plugins.",
-  "license": "Apache-2.0",
-  "repository": "https://github.com/wago-org/workers",
-  "homepage": "https://github.com/wago-org/workers#readme",
-  "category": "concurrency",
-  "tags": ["workers", "concurrency", "webassembly"]
+  "$schema": "https://wago.sh/v1/schema.json",
+  "package": {
+    "module": "github.com/wago-org/workers",
+    "version": "0.1.0",
+    "name": "Workers",
+    "description": "Bounded, composable WebAssembly worker primitives for Wago plugins.",
+    "stability": "experimental",
+    "license": "Apache-2.0",
+    "homepage": "https://github.com/wago-org/workers#readme",
+    "repository": "https://github.com/wago-org/workers",
+    "category": "concurrency",
+    "tags": ["workers", "concurrency", "webassembly", "wasm"],
+    "authors": [{"name": "Wago contributors"}],
+    "engines": {"wago": ">=0.1.0"}
+  }
 }
