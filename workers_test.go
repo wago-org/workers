@@ -11,7 +11,7 @@ import (
 
 	"github.com/wago-org/wago"
 	wagoplugin "github.com/wago-org/wago/plugin"
-	"github.com/wago-org/wago/tests/wasmtest"
+	"github.com/wago-org/wago/tests/support/wasmtest"
 )
 
 type registerFunc func(*wago.Registrar) error
@@ -91,17 +91,13 @@ func integrationProvider(p *integrationPlugin) wago.PluginProvider {
 			if err != nil {
 				return err
 			}
-			module, err := imports.Module("test")
-			if err != nil {
-				return err
-			}
-			module.Func("spawn", func(caller wago.HostModule, _, _ []uint64) {
+			imports.HostFunc("test", "spawn", func(caller wago.Caller, _ wago.HostCall) {
 				_ = p.service.With(func(service Service) error {
 					p.id, _ = service.Spawn(caller, 0, WorkerOptions{QueueCapacity: 1, MaxPayloadBytes: 16, MaxQueueBytes: 16})
 					return nil
 				})
 			})
-			module.Func("next", func(caller wago.HostModule, _, _ []uint64) {
+			imports.HostFunc("test", "next", func(caller wago.Caller, _ wago.HostCall) {
 				_ = p.service.With(func(service Service) error { return service.DispatchNext(context.Background(), caller) })
 			})
 			return reg.Lifecycle(wago.PluginLifecycle{
@@ -210,7 +206,7 @@ func TestPluginContractSpawnsCopiesMessageAndStops(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("exit timeout")
 	}
-	if err := rt.Close(); err != nil {
+	if err := rt.CloseContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if err := p.service.With(func(Service) error { return nil }); !errors.Is(err, wago.ErrPermissionDenied) {
