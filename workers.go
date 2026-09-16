@@ -222,7 +222,7 @@ func Definition() wago.PluginDefinition {
 	return wago.PluginDefinition{
 		ID:          PluginID,
 		Name:        "Workers",
-		Version:     "0.1.0",
+		Version:     "0.1.1",
 		Description: "Bounded, composable WebAssembly worker primitives for Wago plugins.",
 		Stability:   wago.Experimental,
 		Compatibility: wago.Compatibility{

@@ -16,7 +16,7 @@ The package deliberately stops at primitives: spawn, send, receive, link, kill,
 and observe. Policies such as supervision trees, restarts, and guest-visible
 mailbox ABIs belong in a plugin built on top.
 
-> Workers is experimental (`v0.1.0`). Its API may change before the first stable
+> Workers is experimental (`v0.1.1`). Its API may change before the first stable
 > release.
 
 ## Install
